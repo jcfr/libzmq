@@ -7,6 +7,8 @@ list (INSERT CMAKE_MODULE_PATH 0 "${CMAKE_CURRENT_SOURCE_DIR}")
 set (ZMQ_CMAKE_MODULES_DIR ${CMAKE_CURRENT_SOURCE_DIR}/builds/cmake/Modules)
 list (APPEND CMAKE_MODULE_PATH ${ZMQ_CMAKE_MODULES_DIR})
 
+include (ZMQSupportMacros)
+
 include(CheckCXXCompilerFlag)
 CHECK_CXX_COMPILER_FLAG("-std=gnu++11" COMPILER_SUPPORTS_CXX11)
 if(COMPILER_SUPPORTS_CXX11)
@@ -461,8 +463,17 @@ if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
       FORCE)
 endif ()
 
-set (EXECUTABLE_OUTPUT_PATH ${CMAKE_CURRENT_BINARY_DIR}/bin)
-set (LIBRARY_OUTPUT_PATH  ${CMAKE_CURRENT_BINARY_DIR}/lib)
+#-----------------------------------------------------------------------------
+# output directories
+
+zmq_set_with_default(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${ZeroMQ_BINARY_DIR}/bin")
+if(UNIX)
+  set(zmq_library_directory "lib")
+else()
+  set(zmq_library_directory "bin")
+endif()
+zmq_set_with_default(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${ZeroMQ_BINARY_DIR}/${zmq_library_directory}")
+zmq_set_with_default(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${ZeroMQ_BINARY_DIR}/lib")
 
 #-----------------------------------------------------------------------------
 # platform specifics
