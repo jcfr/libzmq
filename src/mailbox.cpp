@@ -27,6 +27,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "precompiled.hpp"
 #include "mailbox.hpp"
 #include "err.hpp"
 
@@ -97,4 +98,9 @@ int zmq::mailbox_t::recv (command_t *cmd_, int timeout_)
     const bool ok = cpipe.read (cmd_);
     zmq_assert (ok);
     return 0;
+}
+
+bool zmq::mailbox_t::valid () const
+{
+    return signaler.valid ();
 }

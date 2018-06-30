@@ -30,25 +30,32 @@
 #ifndef __ZMQ_FD_HPP_INCLUDED__
 #define __ZMQ_FD_HPP_INCLUDED__
 
-#include "platform.hpp"
-
-#ifdef ZMQ_HAVE_WINDOWS
+#if defined _WIN32
 #include "windows.hpp"
 #endif
 
 namespace zmq
 {
 #ifdef ZMQ_HAVE_WINDOWS
-#if defined _MSC_VER &&_MSC_VER <= 1400
-    typedef UINT_PTR fd_t;
-    enum {retired_fd = (fd_t)(~0)};
+#if defined _MSC_VER && _MSC_VER <= 1400
+typedef UINT_PTR fd_t;
+enum
+{
+    retired_fd = (fd_t) (~0)
+};
 #else
-    typedef SOCKET fd_t;
-    enum {retired_fd = (fd_t)INVALID_SOCKET};
+typedef SOCKET fd_t;
+enum
+{
+    retired_fd = (fd_t) INVALID_SOCKET
+};
 #endif
 #else
-    typedef int fd_t;
-    enum {retired_fd = -1};
+typedef int fd_t;
+enum
+{
+    retired_fd = -1
+};
 #endif
 }
 #endif

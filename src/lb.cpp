@@ -27,16 +27,13 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "precompiled.hpp"
 #include "lb.hpp"
 #include "pipe.hpp"
 #include "err.hpp"
 #include "msg.hpp"
 
-zmq::lb_t::lb_t () :
-    active (0),
-    current (0),
-    more (false),
-    dropping (false)
+zmq::lb_t::lb_t () : active (0), current (0), more (false), dropping (false)
 {
 }
 
@@ -88,7 +85,6 @@ int zmq::lb_t::sendpipe (msg_t *msg_, pipe_t **pipe_)
     //  Drop the message if required. If we are at the end of the message
     //  switch back to non-dropping mode.
     if (dropping) {
-
         more = msg_->flags () & msg_t::more ? true : false;
         dropping = more;
 
@@ -100,19 +96,17 @@ int zmq::lb_t::sendpipe (msg_t *msg_, pipe_t **pipe_)
     }
 
     while (active > 0) {
-        if (pipes [current]->write (msg_))
-        {
+        if (pipes[current]->write (msg_)) {
             if (pipe_)
-                *pipe_ = pipes [current];
+                *pipe_ = pipes[current];
             break;
         }
 
         // If send fails for multi-part msg rollback other
         // parts sent earlier and return EAGAIN.
-        // Application should handle this as suitable 
-        if (more)
-        {
-            pipes [current]->rollback ();
+        // Application should handle this as suitable
+        if (more) {
+            pipes[current]->rollback ();
             more = 0;
             errno = EAGAIN;
             return -1;
@@ -133,10 +127,12 @@ int zmq::lb_t::sendpipe (msg_t *msg_, pipe_t **pipe_)
 
     //  If it's final part of the message we can flush it downstream and
     //  continue round-robining (load balance).
-    more = msg_->flags () & msg_t::more? true: false;
+    more = msg_->flags () & msg_t::more ? true : false;
     if (!more) {
-        pipes [current]->flush ();
-        current = (current + 1) % active;
+        pipes[current]->flush ();
+
+        if (++current >= active)
+            current = 0;
     }
 
     //  Detach the message from the data buffer.
@@ -154,9 +150,8 @@ bool zmq::lb_t::has_out ()
         return true;
 
     while (active > 0) {
-
         //  Check whether a pipe has room for another message.
-        if (pipes [current]->check_write ())
+        if (pipes[current]->check_write ())
             return true;
 
         //  Deactivate the pipe.

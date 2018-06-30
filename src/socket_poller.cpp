@@ -27,18 +27,49 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "precompiled.hpp"
 #include "socket_poller.hpp"
 #include "err.hpp"
 
+static bool is_thread_safe (zmq::socket_base_t &socket)
+{
+    int thread_safe;
+    size_t thread_safe_size = sizeof (int);
+
+    int rc =
+      socket.getsockopt (ZMQ_THREAD_SAFE, &thread_safe, &thread_safe_size);
+    zmq_assert (rc == 0);
+    return thread_safe;
+}
+
 zmq::socket_poller_t::socket_poller_t () :
     tag (0xCAFEBABE),
+    signaler (NULL),
     need_rebuild (true),
-    use_signaler (false)
+    use_signaler (false),
+    poll_size (0)
 #if defined ZMQ_POLL_BASED_ON_POLL
     ,
     pollfds (NULL)
+#elif defined ZMQ_POLL_BASED_ON_SELECT
+    ,
+    maxfd (0)
 #endif
 {
+#if defined ZMQ_POLL_BASED_ON_SELECT
+#if defined ZMQ_HAVE_WINDOWS
+    // On Windows fd_set contains array of SOCKETs, each 4 bytes.
+    // For large fd_sets memset() could be expensive and it is unnecessary.
+    // It is enough to set fd_count to 0, exactly what FD_ZERO() macro does.
+    FD_ZERO (&pollset_in);
+    FD_ZERO (&pollset_out);
+    FD_ZERO (&pollset_err);
+#else
+    memset (&pollset_in, 0, sizeof (pollset_in));
+    memset (&pollset_out, 0, sizeof (pollset_out));
+    memset (&pollset_err, 0, sizeof (pollset_err));
+#endif
+#endif
 }
 
 zmq::socket_poller_t::~socket_poller_t ()
@@ -46,14 +77,17 @@ zmq::socket_poller_t::~socket_poller_t ()
     //  Mark the socket_poller as dead
     tag = 0xdeadbeef;
 
-    for (items_t::iterator it = items.begin(); it != items.end(); ++it) {
-        if (it->socket && it->socket->check_tag()) {
-            int thread_safe;
-            size_t thread_safe_size = sizeof(int);
-
-            if (it->socket->getsockopt (ZMQ_THREAD_SAFE, &thread_safe, &thread_safe_size) == 0 && thread_safe)
-                it->socket->remove_signaler (&signaler);
+    for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
+        // TODO shouldn't this zmq_assert (it->socket->check_tag ()) instead?
+        if (it->socket && it->socket->check_tag ()
+            && is_thread_safe (*it->socket)) {
+            it->socket->remove_signaler (signaler);
         }
+    }
+
+    if (signaler != NULL) {
+        delete signaler;
+        signaler = NULL;
     }
 
 #if defined ZMQ_POLL_BASED_ON_POLL
@@ -69,7 +103,9 @@ bool zmq::socket_poller_t::check_tag ()
     return tag == 0xCAFEBABE;
 }
 
-int zmq::socket_poller_t::add (socket_base_t *socket_, void* user_data_, short events_)
+int zmq::socket_poller_t::add (socket_base_t *socket_,
+                               void *user_data_,
+                               short events_)
 {
     for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
         if (it->socket == socket_) {
@@ -78,18 +114,34 @@ int zmq::socket_poller_t::add (socket_base_t *socket_, void* user_data_, short e
         }
     }
 
-    int thread_safe;
-    size_t thread_safe_size = sizeof(int);
+    if (is_thread_safe (*socket_)) {
+        if (signaler == NULL) {
+            signaler = new (std::nothrow) signaler_t ();
+            if (!signaler) {
+                errno = ENOMEM;
+                return -1;
+            }
+            if (!signaler->valid ()) {
+                delete signaler;
+                signaler = NULL;
+                errno = EMFILE;
+                return -1;
+            }
+        }
 
-    if (socket_->getsockopt (ZMQ_THREAD_SAFE, &thread_safe, &thread_safe_size) == -1)
-        return -1;
-
-    if (thread_safe) {
-        if (socket_->add_signaler (&signaler) == -1)
-           return -1;
+        socket_->add_signaler (signaler);
     }
 
-    item_t item = {socket_, 0, user_data_, events_};
+    item_t item = {
+        socket_,
+        0,
+        user_data_,
+        events_
+#if defined ZMQ_POLL_BASED_ON_POLL
+        ,
+        -1
+#endif
+    };
     items.push_back (item);
     need_rebuild = true;
 
@@ -98,21 +150,30 @@ int zmq::socket_poller_t::add (socket_base_t *socket_, void* user_data_, short e
 
 int zmq::socket_poller_t::add_fd (fd_t fd_, void *user_data_, short events_)
 {
-   for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
+    for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
         if (!it->socket && it->fd == fd_) {
             errno = EINVAL;
             return -1;
         }
     }
 
-    item_t item = {NULL, fd_, user_data_, events_};
+    item_t item = {
+        NULL,
+        fd_,
+        user_data_,
+        events_
+#if defined ZMQ_POLL_BASED_ON_POLL
+        ,
+        -1
+#endif
+    };
     items.push_back (item);
     need_rebuild = true;
 
     return 0;
 }
 
-int zmq::socket_poller_t::modify (socket_base_t  *socket_, short events_)
+int zmq::socket_poller_t::modify (socket_base_t *socket_, short events_)
 {
     items_t::iterator it;
 
@@ -121,7 +182,7 @@ int zmq::socket_poller_t::modify (socket_base_t  *socket_, short events_)
             break;
     }
 
-    if (it == items.end()) {
+    if (it == items.end ()) {
         errno = EINVAL;
         return -1;
     }
@@ -142,7 +203,7 @@ int zmq::socket_poller_t::modify_fd (fd_t fd_, short events_)
             break;
     }
 
-    if (it == items.end()) {
+    if (it == items.end ()) {
         errno = EINVAL;
         return -1;
     }
@@ -163,24 +224,17 @@ int zmq::socket_poller_t::remove (socket_base_t *socket_)
             break;
     }
 
-    if (it == items.end()) {
+    if (it == items.end ()) {
         errno = EINVAL;
         return -1;
     }
 
-    int thread_safe;
-    size_t thread_safe_size = sizeof(int);
-
-    if (socket_->getsockopt (ZMQ_THREAD_SAFE, &thread_safe, &thread_safe_size) == -1)
-        return -1;
-
-    if (thread_safe) {
-        if (socket_->remove_signaler (&signaler) == -1)
-            return -1;
-    }
-
     items.erase (it);
     need_rebuild = true;
+
+    if (is_thread_safe (*socket_)) {
+        socket_->remove_signaler (signaler);
+    }
 
     return 0;
 }
@@ -194,7 +248,7 @@ int zmq::socket_poller_t::remove_fd (fd_t fd_)
             break;
     }
 
-    if (it == items.end()) {
+    if (it == items.end ()) {
         errno = EINVAL;
         return -1;
     }
@@ -205,7 +259,7 @@ int zmq::socket_poller_t::remove_fd (fd_t fd_)
     return 0;
 }
 
-int zmq::socket_poller_t::rebuild ()
+void zmq::socket_poller_t::rebuild ()
 {
 #if defined ZMQ_POLL_BASED_ON_POLL
 
@@ -220,73 +274,55 @@ int zmq::socket_poller_t::rebuild ()
 
     for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
         if (it->events) {
-            if (it->socket) {
-                int thread_safe;
-                size_t thread_safe_size = sizeof(int);
-
-                if (it->socket->getsockopt (ZMQ_THREAD_SAFE, &thread_safe, &thread_safe_size) == -1)
-                    return -1;
-
-                if (thread_safe) {
-                    if (!use_signaler) {
-                        use_signaler = true;
-                        poll_size++;
-                    }
-                }
-                else
+            if (it->socket && is_thread_safe (*it->socket)) {
+                if (!use_signaler) {
+                    use_signaler = true;
                     poll_size++;
-            }
-            else
+                }
+            } else
                 poll_size++;
         }
     }
 
     if (poll_size == 0)
-        return 0;
+        return;
 
-    pollfds = (pollfd*) malloc (poll_size * sizeof (pollfd));
+    pollfds = (pollfd *) malloc (poll_size * sizeof (pollfd));
     alloc_assert (pollfds);
 
     int item_nbr = 0;
 
     if (use_signaler) {
         item_nbr = 1;
-        pollfds[0].fd = signaler.get_fd();
+        pollfds[0].fd = signaler->get_fd ();
         pollfds[0].events = POLLIN;
     }
 
     for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
         if (it->events) {
             if (it->socket) {
-                int thread_safe;
-                size_t thread_safe_size = sizeof(int);
-
-                if (it->socket->getsockopt (ZMQ_THREAD_SAFE, &thread_safe, &thread_safe_size) == -1)
-                    return -1;
-
-                if (!thread_safe) {
+                if (!is_thread_safe (*it->socket)) {
                     size_t fd_size = sizeof (zmq::fd_t);
-                    if (it->socket->getsockopt (ZMQ_FD, &pollfds [item_nbr].fd, &fd_size) == -1) {
-                        return -1;
-                    }
+                    int rc = it->socket->getsockopt (
+                      ZMQ_FD, &pollfds[item_nbr].fd, &fd_size);
+                    zmq_assert (rc == 0);
 
-                    pollfds [item_nbr].events = POLLIN;
+                    pollfds[item_nbr].events = POLLIN;
                     item_nbr++;
                 }
-            }
-            else {
-                pollfds [item_nbr].fd = it->fd;
-                pollfds [item_nbr].events =
-                    (it->events & ZMQ_POLLIN ? POLLIN : 0) |
-                    (it->events & ZMQ_POLLOUT ? POLLOUT : 0) |
-                    (it->events & ZMQ_POLLPRI ? POLLPRI : 0);
+            } else {
+                pollfds[item_nbr].fd = it->fd;
+                pollfds[item_nbr].events =
+                  (it->events & ZMQ_POLLIN ? POLLIN : 0)
+                  | (it->events & ZMQ_POLLOUT ? POLLOUT : 0)
+                  | (it->events & ZMQ_POLLPRI ? POLLPRI : 0);
                 it->pollfd_index = item_nbr;
                 item_nbr++;
             }
         }
     }
 
- #elif defined ZMQ_POLL_BASED_ON_SELECT
+#elif defined ZMQ_POLL_BASED_ON_SELECT
 
     FD_ZERO (&pollset_in);
     FD_ZERO (&pollset_out);
@@ -301,19 +337,11 @@ int zmq::socket_poller_t::rebuild ()
     use_signaler = false;
 
     for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
-        if (it->socket) {
-            int thread_safe;
-            size_t thread_safe_size = sizeof(int);
-
-            if (it->socket->getsockopt (ZMQ_THREAD_SAFE, &thread_safe, &thread_safe_size) == -1)
-                return -1;
-
-            if (thread_safe && it->events) {
-                use_signaler = true;
-                FD_SET (signaler.get_fd (), &pollset_in);
-                poll_size = 1;
-                break;
-            }
+        if (it->socket && is_thread_safe (*it->socket) && it->events) {
+            use_signaler = true;
+            FD_SET (signaler->get_fd (), &pollset_in);
+            poll_size = 1;
+            break;
         }
     }
 
@@ -325,17 +353,12 @@ int zmq::socket_poller_t::rebuild ()
             //  If the poll item is a 0MQ socket we are interested in input on the
             //  notification file descriptor retrieved by the ZMQ_FD socket option.
             if (it->socket) {
-                int thread_safe;
-                size_t thread_safe_size = sizeof(int);
-
-                if (it->socket->getsockopt (ZMQ_THREAD_SAFE, &thread_safe, &thread_safe_size) == -1)
-                    return -1;
-
-                if (!thread_safe) {
+                if (!is_thread_safe (*it->socket)) {
                     zmq::fd_t notify_fd;
                     size_t fd_size = sizeof (zmq::fd_t);
-                    if (it->socket->getsockopt (ZMQ_FD, &notify_fd, &fd_size) == -1)
-                        return -1;
+                    int rc =
+                      it->socket->getsockopt (ZMQ_FD, &notify_fd, &fd_size);
+                    zmq_assert (rc == 0);
 
                     FD_SET (notify_fd, &pollset_in);
                     if (maxfd < notify_fd)
@@ -364,30 +387,173 @@ int zmq::socket_poller_t::rebuild ()
 #endif
 
     need_rebuild = false;
-    return 0;
 }
 
-int zmq::socket_poller_t::wait (zmq::socket_poller_t::event_t *event_, long timeout_)
+void zmq::socket_poller_t::zero_trail_events (
+  zmq::socket_poller_t::event_t *events_, int n_events_, int found)
 {
-    if (need_rebuild)
-        if (rebuild () == -1)
-            return -1;
+    for (int i = found; i < n_events_; ++i) {
+        events_[i].socket = NULL;
+        events_[i].fd = 0;
+        events_[i].user_data = NULL;
+        events_[i].events = 0;
+    }
+}
 
 #if defined ZMQ_POLL_BASED_ON_POLL
+int zmq::socket_poller_t::check_events (zmq::socket_poller_t::event_t *events_,
+                                        int n_events_)
+#elif defined ZMQ_POLL_BASED_ON_SELECT
+int zmq::socket_poller_t::check_events (zmq::socket_poller_t::event_t *events_,
+                                        int n_events_,
+                                        fd_set &inset,
+                                        fd_set &outset,
+                                        fd_set &errset)
+#endif
+{
+    int found = 0;
+    for (items_t::iterator it = items.begin ();
+         it != items.end () && found < n_events_; ++it) {
+        //  The poll item is a 0MQ socket. Retrieve pending events
+        //  using the ZMQ_EVENTS socket option.
+        if (it->socket) {
+            size_t events_size = sizeof (uint32_t);
+            uint32_t events;
+            if (it->socket->getsockopt (ZMQ_EVENTS, &events, &events_size)
+                == -1) {
+                return -1;
+            }
+
+            if (it->events & events) {
+                events_[found].socket = it->socket;
+                events_[found].user_data = it->user_data;
+                events_[found].events = it->events & events;
+                ++found;
+            }
+        }
+        //  Else, the poll item is a raw file descriptor, simply convert
+        //  the events to zmq_pollitem_t-style format.
+        else {
+#if defined ZMQ_POLL_BASED_ON_POLL
+
+            short revents = pollfds[it->pollfd_index].revents;
+            short events = 0;
+
+            if (revents & POLLIN)
+                events |= ZMQ_POLLIN;
+            if (revents & POLLOUT)
+                events |= ZMQ_POLLOUT;
+            if (revents & POLLPRI)
+                events |= ZMQ_POLLPRI;
+            if (revents & ~(POLLIN | POLLOUT | POLLPRI))
+                events |= ZMQ_POLLERR;
+
+#elif defined ZMQ_POLL_BASED_ON_SELECT
+
+            short events = 0;
+
+            if (FD_ISSET (it->fd, &inset))
+                events |= ZMQ_POLLIN;
+            if (FD_ISSET (it->fd, &outset))
+                events |= ZMQ_POLLOUT;
+            if (FD_ISSET (it->fd, &errset))
+                events |= ZMQ_POLLERR;
+#endif //POLL_SELECT
+
+            if (events) {
+                events_[found].socket = NULL;
+                events_[found].user_data = it->user_data;
+                events_[found].fd = it->fd;
+                events_[found].events = events;
+                ++found;
+            }
+        }
+    }
+
+    return found;
+}
+
+//Return 0 if timeout is expired otherwise 1
+int zmq::socket_poller_t::adjust_timeout (zmq::clock_t &clock,
+                                          long timeout_,
+                                          uint64_t &now,
+                                          uint64_t &end,
+                                          bool &first_pass)
+{
+    //  If socket_poller_t::timeout is zero, exit immediately whether there
+    //  are events or not.
+    if (timeout_ == 0)
+        return 0;
+
+    //  At this point we are meant to wait for events but there are none.
+    //  If timeout is infinite we can just loop until we get some events.
+    if (timeout_ < 0) {
+        if (first_pass)
+            first_pass = false;
+        return 1;
+    }
+
+    //  The timeout is finite and there are no events. In the first pass
+    //  we get a timestamp of when the polling have begun. (We assume that
+    //  first pass have taken negligible time). We also compute the time
+    //  when the polling should time out.
+    now = clock.now_ms ();
+    if (first_pass) {
+        end = now + timeout_;
+        first_pass = false;
+        return 1;
+    }
+
+    //  Find out whether timeout have expired.
+    if (now >= end)
+        return 0;
+
+    return 1;
+}
+
+int zmq::socket_poller_t::wait (zmq::socket_poller_t::event_t *events_,
+                                int n_events_,
+                                long timeout_)
+{
+    if (items.empty () && timeout_ < 0) {
+        errno = EFAULT;
+        return -1;
+    }
+
+    if (need_rebuild)
+        rebuild ();
+
     if (unlikely (poll_size == 0)) {
+        // We'll report an error (timed out) as if the list was non-empty and
+        // no event occurred within the specified timeout. Otherwise the caller
+        // needs to check the return value AND the event to avoid using the
+        // nullified event data.
+        errno = EAGAIN;
         if (timeout_ == 0)
-            return 0;
+            return -1;
 #if defined ZMQ_HAVE_WINDOWS
         Sleep (timeout_ > 0 ? timeout_ : INFINITE);
-        return 0;
+        return -1;
 #elif defined ZMQ_HAVE_ANDROID
         usleep (timeout_ * 1000);
-        return 0;
+        return -1;
+#elif defined ZMQ_HAVE_OSX
+        usleep (timeout_ * 1000);
+        errno = EAGAIN;
+        return -1;
+#elif defined ZMQ_HAVE_VXWORKS
+        struct timespec ns_;
+        ns_.tv_sec = timeout_ / 1000;
+        ns_.tv_nsec = timeout_ % 1000 * 1000000;
+        nanosleep (&ns_, 0);
+        return -1;
 #else
-        return usleep (timeout_ * 1000);
+        usleep (timeout_ * 1000);
+        return -1;
 #endif
     }
 
+#if defined ZMQ_POLL_BASED_ON_POLL
     zmq::clock_t clock;
     uint64_t now = 0;
     uint64_t end = 0;
@@ -399,8 +565,7 @@ int zmq::socket_poller_t::wait (zmq::socket_poller_t::event_t *event_, long time
         int timeout;
         if (first_pass)
             timeout = 0;
-        else
-        if (timeout_ < 0)
+        else if (timeout_ < 0)
             timeout = -1;
         else
             timeout = end - now;
@@ -417,111 +582,34 @@ int zmq::socket_poller_t::wait (zmq::socket_poller_t::event_t *event_, long time
 
         //  Receive the signal from pollfd
         if (use_signaler && pollfds[0].revents & POLLIN)
-            signaler.recv ();
+            signaler->recv ();
 
         //  Check for the events.
-        for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
-
-            //  The poll item is a 0MQ socket. Retrieve pending events
-            //  using the ZMQ_EVENTS socket option.
-            if (it->socket) {
-                size_t events_size = sizeof (uint32_t);
-                uint32_t events;
-                if (it->socket->getsockopt (ZMQ_EVENTS, &events, &events_size) == -1) {
-                    return -1;
-                }
-
-                if (it->events & events) {
-                    event_->socket = it->socket;
-                    event_->user_data = it->user_data;
-                    event_->events = it->events & events;
-
-                    //  If there is event to return, we can exit immediately.
-                    return 0;
-                }
-            }
-            //  Else, the poll item is a raw file descriptor, simply convert
-            //  the events to zmq_pollitem_t-style format.
-            else {
-                short revents = pollfds [it->pollfd_index].revents;
-                short events = 0;
-
-                if (revents & POLLIN)
-                    events |= ZMQ_POLLIN;
-                if (revents & POLLOUT)
-                    events |= ZMQ_POLLOUT;
-                if (revents & POLLPRI)
-                    events |= ZMQ_POLLPRI;
-                if (revents & ~(POLLIN | POLLOUT | POLLPRI))
-                    events |= ZMQ_POLLERR;
-
-                if (events) {
-                    event_->socket = NULL;
-                    event_->user_data = it->user_data;
-                    event_->fd = it->fd;
-                    event_->events = events;
-
-                    //  If there is event to return, we can exit immediately.
-                    return 0;
-                }
-            }
+        int found = check_events (events_, n_events_);
+        if (found) {
+            if (found > 0)
+                zero_trail_events (events_, n_events_, found);
+            return found;
         }
 
-        //  If timeout is zero, exit immediately whether there are events or not.
-        if (timeout_ == 0)
-            break;
-
-        //  At this point we are meant to wait for events but there are none.
-        //  If timeout is infinite we can just loop until we get some events.
-        if (timeout_ < 0) {
-            if (first_pass)
-                first_pass = false;
-            continue;
-        }
-
-        //  The timeout is finite and there are no events. In the first pass
-        //  we get a timestamp of when the polling have begun. (We assume that
-        //  first pass have taken negligible time). We also compute the time
-        //  when the polling should time out.
-        if (first_pass) {
-            now = clock.now_ms ();
-            end = now + timeout_;
-            if (now == end)
-                break;
-            first_pass = false;
-            continue;
-        }
-
-        //  Find out whether timeout have expired.
-        now = clock.now_ms ();
-        if (now >= end)
+        //  Adjust timeout or break
+        if (adjust_timeout (clock, timeout_, now, end, first_pass) == 0)
             break;
     }
-
-    errno = ETIMEDOUT;
+    errno = EAGAIN;
     return -1;
 
 #elif defined ZMQ_POLL_BASED_ON_SELECT
 
-    if (unlikely (poll_size == 0)) {
-        if (timeout_ == 0)
-            return 0;
-#if defined ZMQ_HAVE_WINDOWS
-        Sleep (timeout_ > 0 ? timeout_ : INFINITE);
-        return 0;
-#else
-        return usleep (timeout_ * 1000);
-#endif
-    }
     zmq::clock_t clock;
     uint64_t now = 0;
     uint64_t end = 0;
 
     bool first_pass = true;
+
     fd_set inset, outset, errset;
 
     while (true) {
-
         //  Compute the timeout for the subsequent poll.
         timeval timeout;
         timeval *ptimeout;
@@ -529,9 +617,7 @@ int zmq::socket_poller_t::wait (zmq::socket_poller_t::event_t *event_, long time
             timeout.tv_sec = 0;
             timeout.tv_usec = 0;
             ptimeout = &timeout;
-        }
-        else
-        if (timeout_ < 0)
+        } else if (timeout_ < 0)
             ptimeout = NULL;
         else {
             timeout.tv_sec = (long) ((end - now) / 1000);
@@ -541,10 +627,20 @@ int zmq::socket_poller_t::wait (zmq::socket_poller_t::event_t *event_, long time
 
         //  Wait for events. Ignore interrupts if there's infinite timeout.
         while (true) {
-            memcpy (&inset, &pollset_in, sizeof (fd_set));
-            memcpy (&outset, &pollset_out, sizeof (fd_set));
-            memcpy (&errset, &pollset_err, sizeof (fd_set));
 #if defined ZMQ_HAVE_WINDOWS
+            // On Windows we don't need to copy the whole fd_set.
+            // SOCKETS are continuous from the beginning of fd_array in fd_set.
+            // We just need to copy fd_count elements of fd_array.
+            // We gain huge memcpy() improvement if number of used SOCKETs is much lower than FD_SETSIZE.
+            memcpy (&inset, &pollset_in,
+                    (char *) (pollset_in.fd_array + pollset_in.fd_count)
+                      - (char *) &pollset_in);
+            memcpy (&outset, &pollset_out,
+                    (char *) (pollset_out.fd_array + pollset_out.fd_count)
+                      - (char *) &pollset_out);
+            memcpy (&errset, &pollset_err,
+                    (char *) (pollset_err.fd_array + pollset_err.fd_count)
+                      - (char *) &pollset_err);
             int rc = select (0, &inset, &outset, &errset, ptimeout);
             if (unlikely (rc == SOCKET_ERROR)) {
                 errno = zmq::wsa_error_to_errno (WSAGetLastError ());
@@ -552,6 +648,9 @@ int zmq::socket_poller_t::wait (zmq::socket_poller_t::event_t *event_, long time
                 return -1;
             }
 #else
+            memcpy (&inset, &pollset_in, sizeof (fd_set));
+            memcpy (&outset, &pollset_out, sizeof (fd_set));
+            memcpy (&errset, &pollset_err, sizeof (fd_set));
             int rc = select (maxfd + 1, &inset, &outset, &errset, ptimeout);
             if (unlikely (rc == -1)) {
                 errno_assert (errno == EINTR || errno == EBADF);
@@ -561,90 +660,30 @@ int zmq::socket_poller_t::wait (zmq::socket_poller_t::event_t *event_, long time
             break;
         }
 
-        if (use_signaler && FD_ISSET (signaler.get_fd (), &inset))
-            signaler.recv ();
+        if (use_signaler && FD_ISSET (signaler->get_fd (), &inset))
+            signaler->recv ();
 
         //  Check for the events.
-        for (items_t::iterator it = items.begin (); it != items.end (); ++it) {
-
-            //  The poll item is a 0MQ socket. Retrieve pending events
-            //  using the ZMQ_EVENTS socket option.
-            if (it->socket) {
-                size_t events_size = sizeof (uint32_t);
-                uint32_t events;
-                if (it->socket->getsockopt (ZMQ_EVENTS, &events, &events_size) == -1)
-                    return -1;
-
-                if (it->events & events) {
-                    event_->socket = it->socket;
-                    event_->user_data = it->user_data;
-                    event_->events = it->events & events;
-
-                    //  If there is event to return, we can exit immediately.
-                    return 0;
-                }
-            }
-            //  Else, the poll item is a raw file descriptor, simply convert
-            //  the events to zmq_pollitem_t-style format.
-            else {
-                short events = 0;
-
-                if (FD_ISSET (it->fd, &inset))
-                    events |= ZMQ_POLLIN;
-                if (FD_ISSET (it->fd, &outset))
-                    events |= ZMQ_POLLOUT;
-                if (FD_ISSET (it->fd, &errset))
-                    events |= ZMQ_POLLERR;
-
-                if (events) {
-                    event_->socket = NULL;
-                    event_->user_data = it->user_data;
-                    event_->fd = it->fd;
-                    event_->events = events;
-
-                    //  If there is event to return, we can exit immediately.
-                    return 0;
-                }
-            }
+        int found = check_events (events_, n_events_, inset, outset, errset);
+        if (found) {
+            if (found > 0)
+                zero_trail_events (events_, n_events_, found);
+            return found;
         }
 
-        //  If timeout is zero, exit immediately whether there are events or not.
-        if (timeout_ == 0)
-            break;
-
-        //  At this point we are meant to wait for events but there are none.
-        //  If timeout is infinite we can just loop until we get some events.
-        if (timeout_ < 0) {
-            if (first_pass)
-                first_pass = false;
-            continue;
-        }
-
-        //  The timeout is finite and there are no events. In the first pass
-        //  we get a timestamp of when the polling have begun. (We assume that
-        //  first pass have taken negligible time). We also compute the time
-        //  when the polling should time out.
-        if (first_pass) {
-            now = clock.now_ms ();
-            end = now + timeout_;
-            if (now == end)
-                break;
-            first_pass = false;
-            continue;
-        }
-
-        //  Find out whether timeout have expired.
-        now = clock.now_ms ();
-        if (now >= end)
+        //  Adjust timeout or break
+        if (adjust_timeout (clock, timeout_, now, end, first_pass) == 0)
             break;
     }
 
-    errno = ETIMEDOUT;
+    errno = EAGAIN;
     return -1;
 
 #else
+
     //  Exotic platforms that support neither poll() nor select().
     errno = ENOTSUP;
     return -1;
+
 #endif
 }

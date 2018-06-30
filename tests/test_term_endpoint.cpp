@@ -27,15 +27,18 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include <stdio.h>
 #include "testutil.hpp"
+
+/* Use the worst case filename size for the buffer (+1 for trailing NUL) */
+#define BUF_SIZE (FILENAME_MAX + 1)
 
 int main (void)
 {
-    setup_test_environment();
+    setup_test_environment ();
     int rc;
-    const size_t buf_size = 32;
-    char buf[buf_size];
-    const char *ep = "tcp://127.0.0.1:5560";
+    char buf[BUF_SIZE];
+    size_t buf_size;
     const char *ep_wc_tcp = "tcp://127.0.0.1:*";
 #if !defined ZMQ_HAVE_WINDOWS && !defined ZMQ_HAVE_OPENVMS
     const char *ep_wc_ipc = "ipc://*";
@@ -49,11 +52,14 @@ int main (void)
     assert (ctx);
     void *push = zmq_socket (ctx, ZMQ_PUSH);
     assert (push);
-    rc = zmq_bind (push, ep);
+    rc = zmq_bind (push, ep_wc_tcp);
+    assert (rc == 0);
+    buf_size = sizeof (buf);
+    rc = zmq_getsockopt (push, ZMQ_LAST_ENDPOINT, buf, &buf_size);
     assert (rc == 0);
     void *pull = zmq_socket (ctx, ZMQ_PULL);
     assert (pull);
-    rc = zmq_connect (pull, ep);
+    rc = zmq_connect (pull, buf);
     assert (rc == 0);
 
     //  Pass one message through to ensure the connection is established
@@ -63,7 +69,10 @@ int main (void)
     assert (rc == 3);
 
     //  Unbind the listening endpoint
-    rc = zmq_unbind (push, ep);
+    buf_size = sizeof (buf);
+    rc = zmq_getsockopt (push, ZMQ_LAST_ENDPOINT, buf, &buf_size);
+    assert (rc == 0);
+    rc = zmq_unbind (push, buf);
     assert (rc == 0);
 
     //  Allow unbind to settle
@@ -84,13 +93,16 @@ int main (void)
     //  Create infrastructure
     ctx = zmq_ctx_new ();
     assert (ctx);
-    push = zmq_socket (ctx, ZMQ_PUSH);
-    assert (push);
-    rc = zmq_connect (push, ep);
-    assert (rc == 0);
     pull = zmq_socket (ctx, ZMQ_PULL);
     assert (pull);
-    rc = zmq_bind (pull, ep);
+    rc = zmq_bind (pull, ep_wc_tcp);
+    assert (rc == 0);
+    buf_size = sizeof (buf);
+    rc = zmq_getsockopt (pull, ZMQ_LAST_ENDPOINT, buf, &buf_size);
+    assert (rc == 0);
+    push = zmq_socket (ctx, ZMQ_PUSH);
+    assert (push);
+    rc = zmq_connect (push, buf);
     assert (rc == 0);
 
     //  Pass one message through to ensure the connection is established.
@@ -100,7 +112,10 @@ int main (void)
     assert (rc == 3);
 
     //  Disconnect the bound endpoint
-    rc = zmq_disconnect (push, ep);
+    buf_size = sizeof (buf);
+    rc = zmq_getsockopt (pull, ZMQ_LAST_ENDPOINT, buf, &buf_size);
+    assert (rc == 0);
+    rc = zmq_disconnect (push, buf);
     assert (rc == 0);
 
     //  Allow disconnect to settle
@@ -125,9 +140,9 @@ int main (void)
     assert (push);
     rc = zmq_bind (push, ep_wc_tcp);
     assert (rc == 0);
-#if !defined ZMQ_HAVE_WINDOWS && !defined ZMQ_HAVE_OPENVMS
     pull = zmq_socket (ctx, ZMQ_PULL);
     assert (pull);
+#if !defined ZMQ_HAVE_WINDOWS && !defined ZMQ_HAVE_OPENVMS
     rc = zmq_bind (pull, ep_wc_ipc);
     assert (rc == 0);
 #endif
@@ -139,22 +154,33 @@ int main (void)
 #endif
 
     // Unbind sockets binded by wild-card address
-    rc = zmq_getsockopt (push, ZMQ_LAST_ENDPOINT, buf, (size_t *)&buf_size);
+    buf_size = sizeof (buf);
+    rc = zmq_getsockopt (push, ZMQ_LAST_ENDPOINT, buf, &buf_size);
     assert (rc == 0);
     rc = zmq_unbind (push, buf);
     assert (rc == 0);
 #if !defined ZMQ_HAVE_WINDOWS && !defined ZMQ_HAVE_OPENVMS
-    rc = zmq_getsockopt (pull, ZMQ_LAST_ENDPOINT, buf, (size_t *)&buf_size);
+    buf_size = sizeof (buf);
+    rc = zmq_getsockopt (pull, ZMQ_LAST_ENDPOINT, buf, &buf_size);
     assert (rc == 0);
     rc = zmq_unbind (pull, buf);
     assert (rc == 0);
 #endif
 #if defined ZMQ_HAVE_VMCI
-    rc = zmq_getsockopt (req, ZMQ_LAST_ENDPOINT, buf, (size_t *)&buf_size);
+    buf_size = sizeof (buf);
+    rc = zmq_getsockopt (req, ZMQ_LAST_ENDPOINT, buf, &buf_size);
     assert (rc == 0);
-    rc = zmq_unbind(req, buf);
+    rc = zmq_unbind (req, buf);
     assert (rc == 0);
 #endif
+
+    //  Clean up.
+    rc = zmq_close (pull);
+    assert (rc == 0);
+    rc = zmq_close (push);
+    assert (rc == 0);
+    rc = zmq_ctx_term (ctx);
+    assert (rc == 0);
 
     //  Create infrastructure (wild-card binding)
     ctx = zmq_ctx_new ();
@@ -163,9 +189,9 @@ int main (void)
     assert (push);
     rc = zmq_bind (push, ep_wc_tcp);
     assert (rc == 0);
-#if !defined ZMQ_HAVE_WINDOWS && !defined ZMQ_HAVE_OPENVMS
     pull = zmq_socket (ctx, ZMQ_PULL);
     assert (pull);
+#if !defined ZMQ_HAVE_WINDOWS && !defined ZMQ_HAVE_OPENVMS
     rc = zmq_bind (pull, ep_wc_ipc);
     assert (rc == 0);
 #endif
@@ -187,6 +213,14 @@ int main (void)
     rc = zmq_unbind (req, ep_wc_vmci);
     assert (rc == -1 && zmq_errno () == ENOENT);
 #endif
+
+    //  Clean up.
+    rc = zmq_close (pull);
+    assert (rc == 0);
+    rc = zmq_close (push);
+    assert (rc == 0);
+    rc = zmq_ctx_term (ctx);
+    assert (rc == 0);
 
     return 0;
 }

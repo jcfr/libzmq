@@ -28,7 +28,6 @@
 */
 
 #include "../include/zmq.h"
-#include "../include/zmq_utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -107,7 +106,7 @@ static void *worker (void *ctx_)
 #endif
 }
 
-int main (int argc, char *argv [])
+int main (int argc, char *argv[])
 {
 #if defined ZMQ_HAVE_WINDOWS
     HANDLE local_thread;
@@ -128,8 +127,8 @@ int main (int argc, char *argv [])
         return 1;
     }
 
-    message_size = atoi (argv [1]);
-    roundtrip_count = atoi (argv [2]);
+    message_size = atoi (argv[1]);
+    roundtrip_count = atoi (argv[2]);
 
     ctx = zmq_init (1);
     if (!ctx) {
@@ -150,8 +149,7 @@ int main (int argc, char *argv [])
     }
 
 #if defined ZMQ_HAVE_WINDOWS
-    local_thread = (HANDLE) _beginthreadex (NULL, 0,
-        worker, ctx, 0 , NULL);
+    local_thread = (HANDLE) _beginthreadex (NULL, 0, worker, ctx, 0, NULL);
     if (local_thread == 0) {
         printf ("error in _beginthreadex\n");
         return -1;
@@ -230,12 +228,11 @@ int main (int argc, char *argv [])
         return -1;
     }
 
-    rc = zmq_term (ctx);
+    rc = zmq_ctx_term (ctx);
     if (rc != 0) {
-        printf ("error in zmq_term: %s\n", zmq_strerror (errno));
+        printf ("error in zmq_ctx_term: %s\n", zmq_strerror (errno));
         return -1;
     }
 
     return 0;
 }
-

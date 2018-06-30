@@ -16,19 +16,14 @@ EXTRA_DIST = \
 	mingw32/Makefile.mingw32 \
 	mingw32/platform.hpp \
 	cmake/Modules \
-	cmake/Modules/FindAsciiDoc.cmake \
-	cmake/Modules/TestZMQVersion.cmake \
-	cmake/Modules/ZMQSourceRunChecks.cmake \
 	cmake/NSIS.template32.in \
-	cmake/platform.hpp.in \
-	cmake/Makefile.am \
-	cmake/Makefile \
 	cmake/NSIS.template64.in \
-	cmake/Makefile.in \
+	cmake/ZeroMQConfig.cmake.in \
+	cmake/platform.hpp.in \
 	valgrind/valgrind.supp \
 	valgrind/vg \
 	nuget/readme.nuget \
 	nuget/libzmq.autopkg \
-	qt-android/android_build_helper.sh \
-	qt-android/ci_build.sh \
-	qt-android/build.sh
+	android/android_build_helper.sh \
+	android/ci_build.sh \
+	android/build.sh

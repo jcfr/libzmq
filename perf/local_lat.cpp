@@ -28,11 +28,10 @@
 */
 
 #include "../include/zmq.h"
-#include "../include/zmq_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 
-int main (int argc, char *argv [])
+int main (int argc, char *argv[])
 {
     const char *bind_to;
     int roundtrip_count;
@@ -45,12 +44,12 @@ int main (int argc, char *argv [])
 
     if (argc != 4) {
         printf ("usage: local_lat <bind-to> <message-size> "
-            "<roundtrip-count>\n");
+                "<roundtrip-count>\n");
         return 1;
     }
-    bind_to = argv [1];
-    message_size = atoi (argv [2]);
-    roundtrip_count = atoi (argv [3]);
+    bind_to = argv[1];
+    message_size = atoi (argv[2]);
+    roundtrip_count = atoi (argv[3]);
 
     ctx = zmq_init (1);
     if (!ctx) {
@@ -107,9 +106,9 @@ int main (int argc, char *argv [])
         return -1;
     }
 
-    rc = zmq_term (ctx);
+    rc = zmq_ctx_term (ctx);
     if (rc != 0) {
-        printf ("error in zmq_term: %s\n", zmq_strerror (errno));
+        printf ("error in zmq_ctx_term: %s\n", zmq_strerror (errno));
         return -1;
     }
 

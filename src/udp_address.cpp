@@ -27,35 +27,34 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#include "precompiled.hpp"
 #include <string>
 #include <sstream>
 
 #include "macros.hpp"
 #include "udp_address.hpp"
-#include "platform.hpp"
 #include "stdint.hpp"
 #include "err.hpp"
 #include "ip.hpp"
 
-#ifdef ZMQ_HAVE_WINDOWS
-#include "windows.hpp"
-#else
+#ifndef ZMQ_HAVE_WINDOWS
 #include <sys/types.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <ctype.h>
 #endif
 
-zmq::udp_address_t::udp_address_t ()
+zmq::udp_address_t::udp_address_t () : is_multicast (false)
 {
     memset (&bind_address, 0, sizeof bind_address);
+    memset (&dest_address, 0, sizeof dest_address);
 }
 
 zmq::udp_address_t::~udp_address_t ()
 {
 }
 
-int zmq::udp_address_t::resolve (const char *name_)
+int zmq::udp_address_t::resolve (const char *name_, bool bind_)
 {
     //  Find the ':' at end that separates address from the port number.
     const char *delimiter = strrchr (name_, ':');
@@ -68,11 +67,6 @@ int zmq::udp_address_t::resolve (const char *name_)
     std::string addr_str (name_, delimiter - name_);
     std::string port_str (delimiter + 1);
 
-    //  Remove square brackets around the address, if any, as used in IPv6
-    if (addr_str.size () >= 2 && addr_str [0] == '[' &&
-          addr_str [addr_str.size () - 1] == ']')
-        addr_str = addr_str.substr (1, addr_str.size () - 2);
-
     //  Parse the port number (0 is not a valid port).
     uint16_t port = (uint16_t) atoi (port_str.c_str ());
     if (port == 0) {
@@ -82,7 +76,12 @@ int zmq::udp_address_t::resolve (const char *name_)
 
     dest_address.sin_family = AF_INET;
     dest_address.sin_port = htons (port);
-    dest_address.sin_addr.s_addr = inet_addr (addr_str.c_str ());
+
+    //  Only when the udp should bind we allow * as the address
+    if (addr_str == "*" && bind_)
+        dest_address.sin_addr.s_addr = htonl (INADDR_ANY);
+    else
+        dest_address.sin_addr.s_addr = inet_addr (addr_str.c_str ());
 
     if (dest_address.sin_addr.s_addr == INADDR_NONE) {
         errno = EINVAL;
@@ -93,22 +92,27 @@ int zmq::udp_address_t::resolve (const char *name_)
     // and if it from 224 to 239, then it can
     // represent multicast IP.
     int i = dest_address.sin_addr.s_addr & 0xFF;
-    if(i >=  224 && i <= 239) {
+    if (i >= 224 && i <= 239) {
         multicast = dest_address.sin_addr;
-        is_mutlicast = true;
-    }
-    else
-        is_mutlicast = false;
+        is_multicast = true;
+    } else
+        is_multicast = false;
 
-    interface.s_addr = htons (INADDR_ANY);
-    if (interface.s_addr == INADDR_NONE) {
+    iface.s_addr = htonl (INADDR_ANY);
+    if (iface.s_addr == INADDR_NONE) {
         errno = EINVAL;
         return -1;
     }
 
-    bind_address.sin_family = AF_INET;
-    bind_address.sin_port = htons (port);
-    bind_address.sin_addr.s_addr = htons (INADDR_ANY);
+    //  If a should bind and not a multicast, the dest address
+    //  is actually the bind address
+    if (bind_ && !is_multicast)
+        bind_address = dest_address;
+    else {
+        bind_address.sin_family = AF_INET;
+        bind_address.sin_port = htons (port);
+        bind_address.sin_addr.s_addr = htonl (INADDR_ANY);
+    }
 
     address = name_;
 
@@ -123,10 +127,10 @@ int zmq::udp_address_t::to_string (std::string &addr_)
 
 bool zmq::udp_address_t::is_mcast () const
 {
-    return is_mutlicast;
+    return is_multicast;
 }
 
-const sockaddr* zmq::udp_address_t::bind_addr () const
+const sockaddr *zmq::udp_address_t::bind_addr () const
 {
     return (sockaddr *) &bind_address;
 }
@@ -136,7 +140,7 @@ socklen_t zmq::udp_address_t::bind_addrlen () const
     return sizeof (sockaddr_in);
 }
 
-const sockaddr* zmq::udp_address_t::dest_addr () const
+const sockaddr *zmq::udp_address_t::dest_addr () const
 {
     return (sockaddr *) &dest_address;
 }
@@ -153,7 +157,7 @@ const in_addr zmq::udp_address_t::multicast_ip () const
 
 const in_addr zmq::udp_address_t::interface_ip () const
 {
-    return interface;
+    return iface;
 }
 
 #if defined ZMQ_HAVE_WINDOWS
